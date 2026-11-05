@@ -1,0 +1,16 @@
+.venv/
+.venv-lock/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.git/
+.gitignore
+tests/
+scripts/
+Dockerfile
+.dockerignore

@@ -1,4 +1,4 @@
-.PHONY: help install test lint fmt check smoke clean
+.PHONY: help install test lint fmt check docker smoke clean
 
 help:
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-10s %s\n", $$1, $$2}'
@@ -21,6 +21,9 @@ fmt: ## Format and autofix
 	. .venv/bin/activate && ruff check --fix src tests scripts
 
 check: lint test ## Everything CI runs locally
+
+docker: ## Build the optional container image
+	docker build -t manapool-mcp:latest .
 
 smoke: ## Drive the server over real MCP stdio (hits the network)
 	. .venv/bin/activate && python scripts/smoke.py

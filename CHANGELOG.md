@@ -17,9 +17,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- The server now runs as a local binary installed with `uv tool install`;
-  Docker packaging removed.
-- Release workflow builds a wheel and sdist instead of a container image.
+- The default runtime is now a local binary installed with `uv tool install`.
+  Docker packaging remains available as an opt-in image.
+- Release workflow publishes a wheel and sdist, and a GHCR image on tags.
 
 ## [0.1.0] - 2026-11-05
 

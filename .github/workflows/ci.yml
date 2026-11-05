@@ -59,3 +59,24 @@ jobs:
           pip check
       - name: Test
         run: pytest -q
+
+  docker:
+    # Optional packaging path: prove the image still builds and speaks MCP.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t manapool-mcp:ci .
+      - name: MCP handshake smoke test
+        # No network: this only proves the image exposes the expected tools.
+        run: |
+          set -euo pipefail
+          response=$(printf '%s\n%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            | docker run -i --rm manapool-mcp:ci)
+          echo "$response"
+          for tool in search_decks get_deck audit_deck search_cards get_card price_deck; do
+            echo "$response" | grep -q "\"name\":\"$tool\""
+          done
