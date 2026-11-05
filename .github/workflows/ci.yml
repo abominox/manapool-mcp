@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install "ruff>=0.6"
+      - name: Lint
+        run: ruff check src tests scripts
+      - name: Format check
+        run: ruff format --check src tests scripts
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Test
+        run: pytest -q --cov=manapool_mcp --cov-report=term-missing
+
+  locked:
+    # Verifies the pinned runtime set used by the Docker image still satisfies
+    # the declared bounds in pyproject.toml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned runtime set
+        run: |
+          pip install -c constraints.txt -e .
+          pip install "pytest>=8" "pytest-asyncio>=0.24"
+          pip check
+      - name: Test
+        run: pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t manapool-mcp:ci .
+      - name: MCP handshake smoke test
+        # No network: this only proves the image speaks MCP over stdio and
+        # exposes the expected tools.
+        run: |
+          set -euo pipefail
+          response=$(printf '%s\n%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            | docker run -i --rm manapool-mcp:ci)
+          echo "$response"
+          echo "$response" | grep -q '"name":"manapool"'
+          echo "$response" | grep -q '"search_decks"'
+          echo "$response" | grep -q '"audit_deck"'
