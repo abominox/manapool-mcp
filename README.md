@@ -81,7 +81,7 @@ tool timeout is 30 seconds, so after `opencode mcp add` add the timeout by hand:
       "manapool": {
         "type": "local",
         "command": ["/Users/you/.local/bin/manapool-mcp"],
-        "timeout": { "execution": 120000 }
+        "timeout": { "execution": 180000 }
       }
     }
   }
