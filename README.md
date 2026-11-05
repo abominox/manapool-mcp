@@ -16,6 +16,8 @@ auditor that checks the list instead of trusting the site's tag.
 | `search_cards` | Card search (Scryfall syntax) priced against ManaPool stock. |
 | `get_card` | One printing's prices and every condition/finish listing. |
 | `price_deck` | Price a decklist: cheapest printing per line, total, missing, short stock. |
+| `validate_decklist` | ManaPool's Commander rules check: legality, singletons, colour identity, partners. **Needs API credentials.** |
+| `optimize_cart` | Quote a decklist as one cart, including availability, shipping and buyer fees. **Needs API credentials.** |
 
 Resources: `manapool://rules/game-changers`, `manapool://rules/brackets`.
 
@@ -72,6 +74,8 @@ It has no authentication.
 
 | Variable | Default | |
 | --- | --- | --- |
+| `MANAPOOL_EMAIL` | unset | Account e-mail. With the token, unlocks the keyed tools. |
+| `MANAPOOL_ACCESS_TOKEN` | unset | API token (`mpat_...`). `MANAPOOL_API_KEY` is accepted as an alias. |
 | `MANAPOOL_TRANSPORT` | `stdio` | or `streamable-http` |
 | `MANAPOOL_HOST` / `MANAPOOL_PORT` | `127.0.0.1` / `8765` | HTTP mode |
 | `MANAPOOL_CACHE_DIR` | `~/.cache/manapool-mcp` | price snapshot location |
@@ -79,11 +83,43 @@ It has no authentication.
 | `MANAPOOL_CACHE_TTL` | `600` | page cache lifetime |
 | `MANAPOOL_MIN_INTERVAL` | `0.2` | seconds between upstream requests |
 
+### API credentials (optional)
+
+Everything works anonymously except two tools. Set both variables to enable
+`validate_decklist` and `optimize_cart`, and to have `audit_deck` include
+ManaPool's own rules check alongside its bracket verdict:
+
+```sh
+export MANAPOOL_EMAIL="you@example.com"
+export MANAPOOL_ACCESS_TOKEN="mpat_..."
+```
+
+Both headers are required by ManaPool's API. A half-configured environment
+fails at startup rather than silently falling back to anonymous access. A
+rejected token surfaces once, immediately, as a credentials error — it is not
+retried.
+
+Two caveats worth knowing:
+
+- **Keyed tools are for stdio or loopback HTTP.** Streamable-HTTP mode has no
+  authentication of its own, so anything that can reach the port would be
+  spending your account's API quota. Bind `127.0.0.1` as above.
+- **`audit_deck` without credentials is still complete for brackets.** It just
+  reports what the card list permits; the authoritative legality block is only
+  present when a key is configured.
+
 ## Notes
 
 - ManaPool's deck pages have no API, so deck tools parse HTML; card tools use
   the public JSON API (`/api/v1/products/singles`, `/prices/singles`). Most of
-  the 53 documented paths require a key and are not wrapped.
+  the 53 documented paths require a key; `/deck` and `/buyer/optimizer` are
+  wrapped only when credentials are configured. `/card_info` overlaps with the
+  Scryfall-backed card tools and is not wrapped; the account, seller, order and
+  inventory-write endpoints are deliberately out of scope.
+- The deck validator resolves cards by name and ManaPool renames some cards
+  ("Memories of Nibelheim (Stroke of Midnight)"), so the alias in the
+  parenthetical is stripped before sending. `cards_not_found` means "not
+  resolved", not "illegal".
 - ManaPool's bracket tag is generated and optimistic. `audit_deck` reports what
   the cards permit, not how the deck plays.
 - Its price sort is only mostly ascending, so wide price windows are sampled and

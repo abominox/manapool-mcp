@@ -91,6 +91,82 @@ class DeckAudit(BaseModel):
     )
     verdict: str
     notes: list[str] = Field(default_factory=list)
+    authoritative: DeckValidation | None = Field(
+        default=None,
+        description=(
+            "ManaPool's own rules check. Only present when API credentials are "
+            "configured; null means not checked, not that the deck is legal."
+        ),
+    )
+
+
+class QuantityViolation(BaseModel):
+    name: str
+    quantity: int
+    max_allowed: int
+
+
+class ColorIdentityViolation(BaseModel):
+    name: str
+    card_colors: list[str] = Field(default_factory=list)
+    commander_colors: list[str] = Field(default_factory=list)
+
+
+class DeckValidation(BaseModel):
+    """ManaPool's Commander rules check. This is legality, not bracket."""
+
+    valid: bool = Field(default=False, description="ManaPool's overall verdict.")
+    commander_count: int = 0
+    total_card_count: int = 0
+    all_cards_legal: bool = True
+    illegal_cards: list[str] = Field(default_factory=list)
+    cards_not_found: list[str] = Field(
+        default_factory=list,
+        description="Names ManaPool could not resolve. Non-empty means the verdict is unreliable.",
+    )
+    valid_quantities: bool = True
+    quantity_violations: list[QuantityViolation] = Field(default_factory=list)
+    valid_color_identity: bool = True
+    color_identity_violations: list[ColorIdentityViolation] = Field(default_factory=list)
+    valid_partnership: bool = True
+    partner_violations: list[str] = Field(default_factory=list)
+    buy_url: str | None = Field(
+        default=None, description="ManaPool's add-to-cart link, present only when valid."
+    )
+    note: str | None = None
+
+
+class CartLine(BaseModel):
+    name: str | None = None
+    set_code: str | None = None
+    number: str | None = None
+    scryfall_id: str | None = None
+    qty: int = 0
+    unit_price: float | None = None
+    line_total: float | None = None
+    inventory_id: str | None = Field(
+        default=None, description="ManaPool inventory item this line was allocated from."
+    )
+
+
+class CartTotals(BaseModel):
+    subtotal_usd: float = 0.0
+    shipping_usd: float = 0.0
+    buyer_fee_usd: float = 0.0
+    gather_fee_usd: float = 0.0
+    total_usd: float = 0.0
+    seller_count: int = 0
+
+
+class CartQuote(BaseModel):
+    total_cards: int = 0
+    total_price: float = Field(default=0.0, description="Total including shipping and fees, USD.")
+    lines: list[CartLine] = Field(default_factory=list)
+    totals: CartTotals | None = None
+    missing: list[str] = Field(
+        default_factory=list, description="Requested cards ManaPool could not allocate."
+    )
+    note: str | None = None
 
 
 class CardPrice(BaseModel):

@@ -12,8 +12,10 @@ from contextlib import asynccontextmanager
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import __version__
+from . import __version__, api
+from .auth import CONFIG_HINT, Credential, credential_problem, load_credentials
 from .client import (
+    AuthError,
     Fetcher,
     NotFoundError,
     UpstreamError,
@@ -25,6 +27,7 @@ from .models import (
     CardEntry,
     CardPrice,
     CardSearchResult,
+    CartQuote,
     ComboInfo,
     DeckAudit,
     DeckDetails,
@@ -32,6 +35,7 @@ from .models import (
     DeckPricing,
     DeckSearchResult,
     DeckTile,
+    DeckValidation,
     Listing,
 )
 from .parse import DeckParseError, deck_id_from, parse_deck_page, parse_deck_tiles, parse_total
@@ -93,22 +97,56 @@ mcp = MCPServer(
         "quoting a deck.\n"
         "Use search_decks to find candidates, get_deck to read one, and "
         "audit_deck to check Game Changers, mass land denial, extra turns and "
-        "Commander Spellbook combos against the official bracket criteria."
+        "Commander Spellbook combos against the official bracket criteria.\n"
+        "When ManaPool API credentials are configured (MANAPOOL_EMAIL and "
+        "MANAPOOL_ACCESS_TOKEN), audit_deck also includes ManaPool's own rules "
+        "check, and validate_decklist and optimize_cart become usable. Those "
+        "two need the credentials; the rest of the tools never do."
     ),
 )
+
+
+def _sync_credentials(fetcher: Fetcher) -> None:
+    """Keep the singleton fetcher's credentials in step with the environment.
+
+    Credentials are read per call, but the Fetcher is built once per process,
+    so a key set (or revoked) after startup must still take effect. Duck-typed
+    test fetchers have no credential surface and are left alone.
+    """
+    install = getattr(fetcher, "set_credentials", None)
+    if install is None:
+        return
+    current = load_credentials()
+    if getattr(fetcher, "credentials", None) != current:
+        install(current)
 
 
 async def _get_fetcher() -> Fetcher:
     global _fetcher, _fetcher_lock
     if _fetcher is not None:
+        _sync_credentials(_fetcher)
         return _fetcher
     if _fetcher_lock is None:
         # Created lazily so the lock binds to the running loop, not to import time.
         _fetcher_lock = asyncio.Lock()
     async with _fetcher_lock:
         if _fetcher is None:
-            _fetcher = Fetcher()
+            _fetcher = Fetcher(credentials=load_credentials())
     return _fetcher
+
+
+def _require_credentials() -> Credential:
+    """The configured credential, or a readable ToolError.
+
+    Purely a check: the fetcher picks the credential up in `_get_fetcher`.
+    """
+    problem = credential_problem()
+    if problem:
+        raise ToolError(problem)
+    credential = load_credentials()
+    if credential is None:
+        raise ToolError(f"These tools need ManaPool API credentials. {CONFIG_HINT}")
+    return credential
 
 
 # --------------------------------------------------------------------------
@@ -482,6 +520,28 @@ async def audit_deck(deck: str) -> DeckAudit:
     if combo_note:
         notes.append(combo_note)
 
+    authoritative: DeckValidation | None = None
+    if load_credentials():
+        # Same degradation rule as the combo check: a failed rules check must
+        # not sink an otherwise useful audit, but it is reported, never hidden.
+        try:
+            authoritative = await api.validate_deck(
+                await _get_fetcher(),
+                commanders,
+                _validation_lines(details.cards, commanders),
+            )
+        except AuthError as exc:
+            notes.append(f"ManaPool validation rejected the credentials: {exc}")
+        except UpstreamError as exc:
+            notes.append(f"ManaPool validation unavailable: {exc}")
+        else:
+            if authoritative.note:
+                notes.append(authoritative.note)
+            notes.append(
+                "Bracket and legality are separate checks: ManaPool's validator "
+                "covers deck construction rules, not power level."
+            )
+
     summary = f"Mechanically at least Bracket {minimum}."
     summary += (
         " Game Changers: " + ", ".join(game_changers) + "."
@@ -507,7 +567,22 @@ async def audit_deck(deck: str) -> DeckAudit:
         mechanical_minimum_bracket=minimum,
         verdict=summary,
         notes=notes,
+        authoritative=authoritative,
     )
+
+
+def _validation_lines(cards: list[CardEntry], commanders: list[str]) -> list[tuple[int, str]]:
+    """(quantity, name) for every non-commander card, as POST /deck expects.
+
+    Commander rows are taken from the card list by name; anything left over is
+    the 99. Basic lands stay in: they are legal 1-ofs the validator knows.
+    """
+    commander_keys = {_norm(api.card_name_for_api(name)) for name in commanders}
+    return [
+        (card.qty, card.name)
+        for card in cards
+        if _norm(api.card_name_for_api(card.name)) not in commander_keys
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -714,6 +789,145 @@ async def price_deck(decklist: str, commander: str | None = None) -> DeckPricing
 
 
 # --------------------------------------------------------------------------
+# Keyed tools (ManaPool API credentials required)
+# --------------------------------------------------------------------------
+
+DECKLIST_NOTE = (
+    "Legality only. This is ManaPool's Commander construction check (colour "
+    "identity, singletons, partner rules); it says nothing about bracket or "
+    "power level - use audit_deck for that."
+)
+
+
+def _parse_decklist(decklist: str) -> list[tuple[int, str]]:
+    """(quantity, name) from any common list format, comments and blanks dropped."""
+    lines: list[tuple[int, str]] = []
+    for raw in decklist.splitlines():
+        stripped = raw.strip()
+        # Whole-line comments only: "//" also separates split cards
+        # ("1 Fire // Ice"), so it cannot be stripped as an inline trailer.
+        if not stripped or stripped.startswith("//"):
+            continue
+        match = re.match(r"^(\d+)\s*[xX]?\s+(.*)$", stripped)
+        qty, name = (int(match.group(1)), match.group(2).strip()) if match else (1, stripped)
+        # Drop MTGO/Arena section pragmas rather than sending them as cards.
+        if name.lower() in {"sideboard", "deck", "commander", "companion", "maybeboard"}:
+            continue
+        if name:
+            lines.append((max(1, qty), name))
+    return lines
+
+
+@mcp.tool()
+async def validate_decklist(decklist: str, commander_names: str) -> DeckValidation:
+    """Check a decklist against ManaPool's Commander rules (needs API credentials).
+
+    Answers "is this a legal Commander deck": card legality, singleton and
+    quantity limits, colour identity against the commander, and partner rules.
+    It does not check bracket; use audit_deck for that.
+
+    Args:
+        decklist: Newline-separated list. Blank lines and whole-line "//"
+            comments are ignored; "//" between two card names is kept, because
+            it separates split cards ("Fire // Ice").
+        commander_names: One per line. Commander names contain commas
+            ("Atraxa, Praetors' Voice"), so commas are not treated as
+            separators; put partners and backgrounds on their own lines.
+    """
+    lines = _parse_decklist(decklist)
+    if not lines:
+        raise ToolError("decklist was empty")
+
+    names = _commander_names(commander_names)
+    if not names:
+        raise ToolError(
+            "commander_names is required for validation: colour identity is checked "
+            "against the commander, so the check cannot run without one."
+        )
+    lowered = {_norm(api.card_name_for_api(name)) for name in names}
+    other = [
+        (qty, name) for qty, name in lines if _norm(api.card_name_for_api(name)) not in lowered
+    ]
+    _require_credentials()
+
+    try:
+        result = await api.validate_deck(await _get_fetcher(), names, other)
+    except AuthError as exc:
+        raise ToolError(str(exc)) from exc
+    except UpstreamError as exc:
+        raise ToolError(str(exc)) from exc
+
+    if result.note:
+        result.note = f"{result.note} {DECKLIST_NOTE}"
+    else:
+        result.note = DECKLIST_NOTE
+    return result
+
+
+@mcp.tool()
+async def optimize_cart(
+    decklist: str,
+    condition: str | None = None,
+    finish: str | None = None,
+    language: str = "EN",
+) -> CartQuote:
+    """Quote a decklist as one ManaPool cart, including shipping and fees.
+
+    Needs API credentials. Unlike price_deck, which sums the cheapest printing
+    per line from the public price snapshot, this asks ManaPool's cart optimizer
+    to pick actual in-stock copies, so it reflects availability, seller count,
+    shipping and buyer fees.
+
+    Args:
+        decklist: Newline-separated list ("1 Sol Ring", "4x Forest", "Sol Ring").
+        condition: Worst acceptable condition: NM, LP, MP, HP or DMG.
+        finish: NF (non-foil), FO or EF (etched). Omit for any.
+        language: Language code, EN by default. Omit restrictions by passing "".
+    """
+    lines = _parse_decklist(decklist)
+    if not lines:
+        raise ToolError("decklist was empty")
+    conditions = _one_of(condition, {"NM", "LP", "MP", "HP", "DMG"}, "condition")
+    finishes = _one_of(finish, {"NF", "FO", "EF"}, "finish")
+    languages = [language.upper()] if language else None
+    _require_credentials()
+
+    try:
+        return await api.optimize_cart(
+            await _get_fetcher(),
+            lines,
+            conditions=conditions,
+            finishes=finishes,
+            languages=languages,
+        )
+    except AuthError as exc:
+        raise ToolError(str(exc)) from exc
+    except UpstreamError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _commander_names(value: str | None) -> list[str]:
+    """Commander names from a newline-separated string.
+
+    Deliberately not comma-split: Commander names contain commas ("Atraxa,
+    Praetors' Voice"), so a comma is data, not a separator. Partners and
+    backgrounds go on their own line.
+    """
+    if not value:
+        return []
+    return [line.strip() for line in value.splitlines() if line.strip()]
+
+
+def _one_of(value: str | None, allowed: set[str], label: str) -> list[str] | None:
+    if not value:
+        return None
+    cleaned = value.strip().upper()
+    if cleaned not in allowed:
+        raise ToolError(f"{label} must be one of {sorted(allowed)}, got {value!r}")
+    return [cleaned]
+
+
+# --------------------------------------------------------------------------
 # Resources
 # --------------------------------------------------------------------------
 
@@ -791,6 +1005,11 @@ def _match(
 
 
 def main() -> None:
+    # Fail fast on a half-configured credential pair rather than letting the
+    # keyed tools fail one call at a time.
+    problem = credential_problem()
+    if problem:
+        raise SystemExit(problem)
     raw = os.environ.get("MANAPOOL_TRANSPORT", "stdio").lower().strip()
     if raw not in TRANSPORTS:
         raise ValueError(f"MANAPOOL_TRANSPORT must be one of {sorted(TRANSPORTS)}, got {raw!r}")

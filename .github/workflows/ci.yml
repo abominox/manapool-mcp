@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # This repo's default branch is `master`; `main` is kept so a rename does
+    # not silently stop CI from running on pushes.
+    branches: [master, main]
   pull_request:
 
 concurrency:
@@ -77,6 +79,7 @@ jobs:
             '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
             | docker run -i --rm manapool-mcp:ci)
           echo "$response"
-          for tool in search_decks get_deck audit_deck search_cards get_card price_deck; do
+          for tool in search_decks get_deck audit_deck search_cards get_card price_deck \
+                      validate_decklist optimize_cart; do
             echo "$response" | grep -q "\"name\":\"$tool\""
           done
