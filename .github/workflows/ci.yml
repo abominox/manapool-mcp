@@ -71,12 +71,15 @@ jobs:
         run: docker build -t manapool-mcp:ci .
       - name: MCP handshake smoke test
         # No network: this only proves the image exposes the expected tools.
+        # stdin is held open for a second: piping the requests and closing
+        # immediately races the server, which can exit on EOF before it has
+        # written the tools/list response (reproduced ~1 in 12 runs).
         run: |
           set -euo pipefail
-          response=$(printf '%s\n%s\n%s\n' \
+          response=$({ printf '%s\n%s\n%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
             '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'; sleep 1; } \
             | docker run -i --rm manapool-mcp:ci)
           echo "$response"
           for tool in search_decks get_deck audit_deck search_cards get_card price_deck \
