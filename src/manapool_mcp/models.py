@@ -91,3 +91,77 @@ class DeckAudit(BaseModel):
     )
     verdict: str
     notes: list[str] = Field(default_factory=list)
+
+
+class CardPrice(BaseModel):
+    name: str
+    set_code: str | None = None
+    set_name: str | None = None
+    scryfall_id: str | None = None
+    type_line: str | None = None
+    mana_value: float | None = None
+    price_usd: float | None = Field(
+        default=None, description="Lowest available price across conditions."
+    )
+    nm_usd: float | None = Field(default=None, description="Near-mint price.")
+    foil_usd: float | None = None
+    market_usd: float | None = None
+    stock: int = 0
+    url: str | None = None
+
+
+class CardSearchResult(BaseModel):
+    query: str
+    total_cards: int | None = None
+    cards: list[CardPrice] = Field(default_factory=list)
+    missing_from_manapool: list[str] = Field(default_factory=list)
+
+
+class Listing(BaseModel):
+    condition: str | None = None
+    finish: str | None = None
+    language: str | None = None
+    price_usd: float | None = None
+    quantity: int = 0
+
+
+class CardDetails(BaseModel):
+    name: str
+    set_code: str | None = None
+    set_name: str | None = None
+    scryfall_id: str | None = None
+    type_line: str | None = None
+    oracle_text: str | None = None
+    price_usd: float | None = None
+    nm_usd: float | None = None
+    foil_usd: float | None = None
+    market_usd: float | None = None
+    stock: int = 0
+    url: str | None = None
+    listings: list[Listing] = Field(default_factory=list)
+
+
+class DeckPriceLine(BaseModel):
+    name: str
+    qty: int = 1
+    unit_price: float | None = None
+    line_total: float | None = None
+    set_code: str | None = None
+    number: str | None = None
+    available: int = 0
+    short: bool = Field(
+        default=False,
+        description="True when ManaPool stock is below the requested quantity.",
+    )
+
+
+class DeckPricing(BaseModel):
+    as_of: str | None = None
+    total_cards: int = 0
+    total_price: float = 0.0
+    commander: str | None = None
+    commander_price: float | None = None
+    lines: list[DeckPriceLine] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    short: list[str] = Field(default_factory=list)
+    note: str | None = None

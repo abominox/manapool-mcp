@@ -44,7 +44,7 @@ jobs:
         run: pytest -q --cov=manapool_mcp --cov-report=term-missing
 
   locked:
-    # Verifies the pinned runtime set used by the Docker image still satisfies
+    # Verifies the pinned runtime set still satisfies
     # the declared bounds in pyproject.toml.
     runs-on: ubuntu-latest
     steps:
@@ -59,24 +59,3 @@ jobs:
           pip check
       - name: Test
         run: pytest -q
-
-  docker:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build image
-        run: docker build -t manapool-mcp:ci .
-      - name: MCP handshake smoke test
-        # No network: this only proves the image speaks MCP over stdio and
-        # exposes the expected tools.
-        run: |
-          set -euo pipefail
-          response=$(printf '%s\n%s\n%s\n' \
-            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
-            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-            | docker run -i --rm manapool-mcp:ci)
-          echo "$response"
-          echo "$response" | grep -q '"name":"manapool"'
-          echo "$response" | grep -q '"search_decks"'
-          echo "$response" | grep -q '"audit_deck"'

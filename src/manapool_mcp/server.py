@@ -20,8 +20,23 @@ from .client import (
     deck_url,
     decks_url,
 )
-from .models import CardEntry, ComboInfo, DeckAudit, DeckDetails, DeckSearchResult, DeckTile
+from .models import (
+    CardDetails,
+    CardEntry,
+    CardPrice,
+    CardSearchResult,
+    ComboInfo,
+    DeckAudit,
+    DeckDetails,
+    DeckPriceLine,
+    DeckPricing,
+    DeckSearchResult,
+    DeckTile,
+    Listing,
+)
 from .parse import DeckParseError, deck_id_from, parse_deck_page, parse_deck_tiles, parse_total
+from .prices import load_price_book
+from .products import cents_to_usd, products_by_scryfall_ids
 from .rules import (
     BRACKET_CRITERIA,
     EXTRA_TURNS,
@@ -30,6 +45,8 @@ from .rules import (
     TUTORS,
     mechanical_bracket,
 )
+from .scryfall import card_by_id, card_by_set_number, cards_by_name
+from .scryfall import search as scryfall_search
 from .spellbook import find_combos
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -397,21 +414,10 @@ async def get_deck(deck: str, include_types: bool = False) -> DeckDetails:
 
 async def _scryfall_types(fetcher: Fetcher, names: list[str]) -> dict[str, str]:
     missing = [n for n in dict.fromkeys(names) if _norm(n) not in _types_cache]
-    for start in range(0, len(missing), 75):
-        chunk = missing[start : start + 75]
-        payload = {"identifiers": [{"name": n} for n in chunk]}
-        try:
-            data = await fetcher.post_json("https://api.scryfall.com/cards/collection", payload)
-        except UpstreamError:
-            break
-        if not isinstance(data, dict):
-            break
-        for card in data.get("data", []) or []:
-            if isinstance(card, dict) and card.get("name"):
-                _types_cache[_norm(card["name"])] = card.get("type_line", "")
-        for card in data.get("not_found", []) or []:
-            if isinstance(card, dict) and card.get("name"):
-                _types_cache[_norm(card["name"])] = ""
+    if missing:
+        resolved = await cards_by_name(fetcher, missing)
+        for key, card in resolved.items():
+            _types_cache[key] = (card or {}).get("type_line", "")
     return {_norm(name): _types_cache.get(_norm(name), "") for name in names}
 
 
@@ -501,6 +507,209 @@ async def audit_deck(deck: str) -> DeckAudit:
         mechanical_minimum_bracket=minimum,
         verdict=summary,
         notes=notes,
+    )
+
+
+# --------------------------------------------------------------------------
+# Card tools (public ManaPool API + Scryfall)
+# --------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def search_cards(query: str, limit: int = 15) -> CardSearchResult:
+    """Search cards and price them against ManaPool stock.
+
+    Args:
+        query: Scryfall search syntax, e.g. `!"Sol Ring"`, `t:elf ci:bg`,
+            `oracle:"draw a card" o:commander`, `set:dsk rarity:mythic`.
+        limit: Maximum cards to return (1-50).
+
+    ManaPool's public API has no name search, so the search runs on Scryfall
+    and each result is then priced from ManaPool's /products/singles.
+    """
+    limit = max(1, min(int(limit), 50))
+    fetcher = await _get_fetcher()
+    cards = await scryfall_search(fetcher, query, limit=limit)
+    if not cards:
+        return CardSearchResult(query=query, total_cards=0)
+
+    products = await products_by_scryfall_ids(
+        fetcher, [card["id"] for card in cards if card.get("id")]
+    )
+    index = _product_index(products)
+    priced: list[CardPrice] = []
+    missing: list[str] = []
+    for card in cards:
+        record = index.get(card.get("id", ""))
+        if record is None:
+            missing.append(card.get("name", ""))
+        priced.append(_card_price(card, record))
+    return CardSearchResult(
+        query=query,
+        total_cards=len(cards),
+        cards=priced,
+        missing_from_manapool=[name for name in missing if name],
+    )
+
+
+@mcp.tool()
+async def get_card(card: str) -> CardDetails:
+    """Get one card's ManaPool prices and per-listing availability.
+
+    Args:
+        card: A card name, a Scryfall id, or a ManaPool card URL such as
+            https://manapool.com/card/sld/2683/sol-ring.
+    """
+    fetcher = await _get_fetcher()
+    resolved = await _resolve_card(fetcher, card)
+    if resolved is None:
+        raise ToolError(f"Could not resolve card: {card!r}")
+    scryfall_id = resolved.get("id")
+    products = await products_by_scryfall_ids(fetcher, [scryfall_id] if scryfall_id else [])
+    record = _product_index(products).get(scryfall_id or "")
+
+    listings: list[Listing] = []
+    for variant in (record or {}).get("variants", []) or []:
+        if not isinstance(variant, dict):
+            continue
+        listings.append(
+            Listing(
+                condition=variant.get("condition_id"),
+                finish=variant.get("finish_id"),
+                language=variant.get("language_id"),
+                price_usd=cents_to_usd(variant.get("low_price")),
+                quantity=int(variant.get("available_quantity") or 0),
+            )
+        )
+    listings.sort(key=lambda item: (item.price_usd is None, item.price_usd or 0))
+
+    return CardDetails(
+        name=resolved.get("name", card),
+        set_code=(record or {}).get("set_code") or resolved.get("set"),
+        set_name=resolved.get("set_name"),
+        scryfall_id=scryfall_id,
+        type_line=resolved.get("type_line"),
+        oracle_text=resolved.get("oracle_text"),
+        price_usd=cents_to_usd((record or {}).get("price_cents")),
+        nm_usd=cents_to_usd((record or {}).get("price_cents_nm")),
+        foil_usd=cents_to_usd((record or {}).get("price_cents_foil")),
+        market_usd=cents_to_usd((record or {}).get("price_market")),
+        stock=int((record or {}).get("available_quantity") or 0),
+        url=(record or {}).get("url"),
+        listings=listings,
+    )
+
+
+async def _resolve_card(fetcher: Fetcher, value: str):
+    value = value.strip()
+    match = re.search(r"/card/([^/]+)/([^/?#]+)", value)
+    if match:
+        return await card_by_set_number(fetcher, match.group(1), match.group(2))
+    if re.fullmatch(r"[0-9a-fA-F-]{36}", value):
+        return await card_by_id(fetcher, value)
+    resolved = await cards_by_name(fetcher, [value])
+    return resolved.get(_norm(value))
+
+
+def _product_index(products: list[dict]) -> dict[str, dict]:
+    index: dict[str, dict] = {}
+    for record in products:
+        if not isinstance(record, dict):
+            continue
+        for key in [record.get("scryfall_id"), *(record.get("scryfall_ids") or [])]:
+            if key:
+                index[key] = record
+    return index
+
+
+def _card_price(card: dict, record: dict | None) -> CardPrice:
+    record = record or {}
+    return CardPrice(
+        name=card.get("name", ""),
+        set_code=record.get("set_code") or card.get("set"),
+        set_name=card.get("set_name"),
+        scryfall_id=card.get("id"),
+        type_line=card.get("type_line"),
+        mana_value=card.get("cmc"),
+        price_usd=cents_to_usd(record.get("price_cents")),
+        nm_usd=cents_to_usd(record.get("price_cents_nm")),
+        foil_usd=cents_to_usd(record.get("price_cents_foil")),
+        market_usd=cents_to_usd(record.get("price_market")),
+        stock=int(record.get("available_quantity") or 0),
+        url=record.get("url"),
+    )
+
+
+# --------------------------------------------------------------------------
+# pricing
+# --------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def price_deck(decklist: str, commander: str | None = None) -> DeckPricing:
+    """Price a decklist against ManaPool's live singles inventory.
+
+    Accepts any text list ("1 Card Name", "4x Card Name", "Card Name") and
+    prices each line at the cheapest in-stock printing. Use this to budget a
+    custom build; ManaPool's own pre-built decks are always a single seller's
+    stock, so their cart total and this estimate differ.
+
+    Args:
+        decklist: Newline-separated list. Blank lines and "//" comments ignored.
+        commander: Optional commander, priced and reported separately.
+    """
+    book = await load_price_book(await _get_fetcher())
+    wanted: list[tuple[int, str]] = []
+    for raw in decklist.splitlines():
+        line = raw.split("//")[0].strip()
+        if not line:
+            continue
+        match = re.match(r"^(\d+)\s*[xX]?\s+(.*)$", line)
+        if match:
+            wanted.append((int(match.group(1)), match.group(2).strip()))
+        else:
+            wanted.append((1, line))
+    if not wanted:
+        raise ToolError("decklist was empty")
+
+    lines: list[DeckPriceLine] = []
+    for qty, name in wanted:
+        printing = book.cheapest(name, min_quantity=1)
+        if printing is None:
+            lines.append(DeckPriceLine(name=name, qty=qty, unit_price=None, line_total=None))
+            continue
+        lines.append(
+            DeckPriceLine(
+                name=name,
+                qty=qty,
+                unit_price=printing.unit_price,
+                line_total=round(printing.unit_price * qty, 2),
+                set_code=printing.set_code,
+                number=printing.number,
+                available=printing.available,
+                short=printing.available < qty,
+            )
+        )
+
+    priced = [line for line in lines if line.line_total is not None]
+    missing = [line.name for line in lines if line.unit_price is None]
+    short = [line.name for line in lines if line.short]
+    total_cards = sum(line.qty for line in lines)
+    return DeckPricing(
+        as_of=book.as_of,
+        total_cards=total_cards,
+        total_price=round(sum(line.line_total or 0 for line in priced), 2),
+        commander=commander,
+        commander_price=(
+            book.cheapest(commander).unit_price if commander and book.cheapest(commander) else None
+        ),
+        lines=lines,
+        missing=missing,
+        short=short,
+        note=(
+            "Cheapest in-stock printing for each line, not a single-seller cart. "
+            "Add shipping and expect +/-10% drift as stock moves."
+        ),
     )
 
 

@@ -20,7 +20,6 @@ pytest -q
 make lint   # ruff check + format --check
 make fmt    # ruff format + autofix
 make test   # pytest
-make docker # build the image
 ```
 
 ## What to be careful with
@@ -36,6 +35,9 @@ Changes to the parser are the risky kind:
   needs a test with out-of-order pages.
 - **Capture a fixture first.** `tests/fixtures/*.html` are real pages. If the
   markup changes, add a new fixture and a test rather than loosening a regex.
+- **Cards use the API, decks use HTML.** ManaPool's public API indexes cards
+  by Scryfall id and has no name search; deck browsing has no API at all. Keep
+  new card features on `/api/v1`, and keep deck parsing conservative.
 - **Bracket rules are cited, not invented.** `rules.py` documents its sources
   and the date the Game Changers list was current. Update both together.
 

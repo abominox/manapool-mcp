@@ -26,6 +26,16 @@ class NotFoundError(UpstreamError):
     """The requested deck or page does not exist (any more)."""
 
 
+def _retry_after(response: httpx.Response, default: float = 1.0) -> float:
+    """Seconds to wait from a Retry-After header, capped for tool-call sanity."""
+    raw = response.headers.get("Retry-After")
+    try:
+        delay = float(raw) if raw is not None else default
+    except ValueError:
+        delay = default
+    return max(0.5, min(delay, 10.0))
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -77,8 +87,8 @@ class Fetcher:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def get_text(self, url: str) -> str:
-        return await self._request("GET", url)
+    async def get_text(self, url: str, *, use_cache: bool = True) -> str:
+        return await self._request("GET", url, use_cache=use_cache)
 
     async def get_many(self, urls: list[str], concurrency: int = 4) -> list[str]:
         """Fetch several pages concurrently.
@@ -94,6 +104,15 @@ class Fetcher:
 
         return list(await asyncio.gather(*(one(url) for url in urls)))
 
+    async def get_json(self, url: str) -> Any:
+        import json
+
+        raw = await self._request("GET", url)
+        try:
+            return json.loads(raw)
+        except ValueError as exc:  # pragma: no cover - defensive
+            raise UpstreamError(f"{url} returned invalid JSON") from exc
+
     async def post_json(self, url: str, payload: dict[str, Any]) -> Any:
         raw = await self._request("POST", url, json=payload)
         import json
@@ -103,11 +122,13 @@ class Fetcher:
         except ValueError as exc:  # pragma: no cover - defensive
             raise UpstreamError(f"{url} returned invalid JSON") from exc
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> str:
+    async def _request(
+        self, method: str, url: str, *, use_cache: bool = True, **kwargs: Any
+    ) -> str:
         cache_key = f"{method} {url} {kwargs.get('json')!r}"
         now = time.monotonic()
         cached = self._cache.get(cache_key)
-        if cached is not None and now - cached[0] < self.cache_ttl:
+        if use_cache and cached is not None and now - cached[0] < self.cache_ttl:
             return cached[1]
 
         await self._throttle()
@@ -119,10 +140,19 @@ class Fetcher:
                     raise NotFoundError(
                         f"{url} returned 404. The deck may have been rebuilt or removed."
                     )
-                if response.status_code == 429 or response.status_code >= 500:
+                if response.status_code == 429:
+                    delay = _retry_after(response)
+                    last_error = UpstreamError(f"{url} is rate limited (HTTP 429)")
+                    if attempt < 2:
+                        await asyncio.sleep(delay)
+                        continue
+                    raise last_error
+                if response.status_code >= 500:
                     raise UpstreamError(f"{url} returned HTTP {response.status_code}")
                 response.raise_for_status()
                 text = response.text
+                if not use_cache:
+                    return text
                 previous = self._cache.get(cache_key)
                 if previous is not None:
                     self._cache_size -= len(previous[1])

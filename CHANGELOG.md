@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `search_cards`, `get_card` and `price_deck`, backed by ManaPool's public API
+  (`/products/singles`, `/prices/singles`) and Scryfall for name resolution.
+- `README` section mapping the 53-path ManaPool OpenAPI surface to the
+  endpoints that are actually public.
+- `Retry-After` handling for rate-limited upstreams.
+- Disk-cached price snapshot (`~/.cache/manapool-mcp`).
+
+### Changed
+
+- The server now runs as a local binary installed with `uv tool install`;
+  Docker packaging removed.
+- Release workflow builds a wheel and sdist instead of a container image.
+
 ## [0.1.0] - 2026-11-05
 
 ### Added

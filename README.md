@@ -1,7 +1,7 @@
 # manapool-mcp
 
-An MCP server for [ManaPool](https://manapool.com/decks)'s pre-built Commander
-decks, with a bracket auditor that checks the list instead of trusting the tag.
+An MCP server for [ManaPool](https://manapool.com)'s Commander decks and card
+prices, with a bracket auditor that checks the list instead of trusting the tag.
 
 [![CI](https://github.com/abominox/manapool-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/abominox/manapool-mcp/actions/workflows/ci.yml)
 [![Release](https://github.com/abominox/manapool-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/abominox/manapool-mcp/actions/workflows/release.yml)
@@ -15,17 +15,20 @@ and optimistic. In a survey of 704 listings priced $60–80, only 7% contained a
 single Game Changer, yet nearly all were tagged "Bracket 3". A deck can also be
 tagged 3 and genuinely play like Core.
 
-This server exposes the listings as tools and, more importantly, audits the card
-list against the official criteria: Game Changers, mass land denial, extra
-turns, and Commander Spellbook combos.
+This server exposes the decks as tools and audits the card list against the
+official criteria: Game Changers, mass land denial, extra turns and Commander
+Spellbook combos.
 
 ## Tools
 
-| Tool | What it does |
-| --- | --- |
-| `search_decks` | Search or browse listings by commander, bracket, theme, colours and price window. |
-| `get_deck` | One deck: commander(s), seller, price, section counts, every card with quantity and price. Optional Scryfall type lines. |
-| `audit_deck` | Official bracket checks plus the lowest bracket the list mechanically permits, with reasons. |
+| Tool | Source | What it does |
+| --- | --- | --- |
+| `search_decks` | ManaPool HTML | Browse pre-built decks by commander, bracket, theme, colours and price window. |
+| `get_deck` | ManaPool HTML | One deck: commander(s), seller, price, section counts, every card with quantity and price. |
+| `audit_deck` | HTML + Spellbook | Bracket checks and the lowest bracket the list mechanically permits, with reasons. |
+| `search_cards` | Scryfall + ManaPool API | Search cards with Scryfall syntax, priced against ManaPool stock. |
+| `price_deck` | ManaPool API | Price a decklist with quantities; cheapest printing per line, totals, missing and short-stock flags. |
+| `get_card` | ManaPool API | One printing: low/NM/foil/market price and every condition/finish listing. |
 
 Resources: `manapool://rules/game-changers` and `manapool://rules/brackets`.
 
@@ -36,57 +39,78 @@ tool.
 
 ## Install
 
-### Local
+ManaPool's deck pages have no API, so the deck tools parse HTML. The card tools
+use ManaPool's public JSON API. Both run in one local process — no Docker, no
+service to keep running.
 
 ```sh
 git clone https://github.com/abominox/manapool-mcp.git
 cd manapool-mcp
-uv venv --python 3.12 .venv
-. .venv/bin/activate
-uv pip install -e ".[dev]"
+uv tool install --constraints constraints.txt .
 ```
 
-Register with OpenCode:
+That puts `manapool-mcp` in `~/.local/bin` in its own isolated environment.
+Register it with OpenCode:
 
 ```sh
-opencode mcp add manapool --global -- \
-  "$PWD/.venv/bin/manapool-mcp"
+opencode mcp add manapool --global -- ~/.local/bin/manapool-mcp
 ```
 
-### Docker
+For development, install editable instead so edits take effect immediately:
 
 ```sh
-docker build -t manapool-mcp:latest .
-docker run -i --rm manapool-mcp:latest     # stdio, for OpenCode
+uv tool install --force --constraints constraints.txt -e .
 ```
 
-`-i` is required for stdio; do not add `-t`. Register the container:
+Upgrade after a `git pull`:
 
 ```sh
-opencode mcp add manapool --global -- \
-  docker run -i --rm manapool-mcp:latest
+uv tool install --force --constraints constraints.txt .
 ```
 
-Rebuild the image after code changes — `docker run` never re-pulls `:latest`,
-and OpenCode keeps the MCP process open, so `/reload` or a new session is
-needed to pick up a rebuild.
+### Slow calls need a longer timeout
 
-If Docker is not running when OpenCode starts, the server shows as
-disconnected for that session. Nothing is left behind.
+A deck price window that spans the whole catalogue takes 20–40 seconds, and the
+first `price_deck` call downloads a ~53 MB price snapshot. OpenCode's default
+tool timeout is 30 seconds, so after `opencode mcp add` add the timeout by hand:
 
-### HTTP
-
-```sh
-docker run --rm -p 127.0.0.1:8765:8765 \
-  -e MANAPOOL_TRANSPORT=streamable-http \
-  -e MANAPOOL_HOST=0.0.0.0 \
-  manapool-mcp:latest
+```jsonc
+{
+  "mcp": {
+    "servers": {
+      "manapool": {
+        "type": "local",
+        "command": ["/Users/you/.local/bin/manapool-mcp"],
+        "timeout": { "execution": 120000 }
+      }
+    }
+  }
+}
 ```
 
-Then point OpenCode at `http://127.0.0.1:8765/mcp`. Bind to `0.0.0.0` inside
-the container (the code default is loopback, which in a container means only the
-container itself) but publish on loopback only: HTTP mode has no authentication
-and the SDK's DNS-rebinding guard only applies on loopback.
+Searches that include a `commander` finish in a second or two.
+
+## What the ManaPool API exposes
+
+ManaPool publishes an OpenAPI document at
+`https://manapool.com/api/docs/v1/openapi.json` (title "Mana Pool Public API",
+v0.55.0, 53 paths). Most of it is authenticated. In practice:
+
+| Public, no credentials | Authenticated (401 without a key) |
+| --- | --- |
+| `GET /prices/singles` — every in-stock printing, ~106k rows, 53 MB | `POST /deck` — deck validator |
+| `GET /prices/sealed` — sealed price export | `POST /card_info` — card lookup |
+| `GET /prices/variants` — per-listing export, ~203 MB | `POST /buyer/optimizer` — cart optimizer |
+| `GET /products/singles` — product records by Scryfall/TCGplayer id | `GET /account`, `/buyer/*`, `/seller/*`, `/inventory/*`, `/webhooks` |
+
+This server uses `products/singles` for exact printings and variants, and
+`prices/singles` (disk-cached, daily) for cheapest-across-printings. The bulk
+`prices/variants` export is not wrapped: 203 MB per refresh is a batch job, not
+a tool call.
+
+There is no public name search in the API, so `search_cards` runs the query on
+Scryfall and joins the results to ManaPool products by Scryfall id. Deck
+browsing has no API equivalent at all, hence the HTML parser.
 
 ## Configuration
 
@@ -97,36 +121,24 @@ and the SDK's DNS-rebinding guard only applies on loopback.
 | `MANAPOOL_PORT` | `8765` | HTTP port |
 | `MANAPOOL_CACHE_TTL` | `600` | Seconds to cache fetched pages |
 | `MANAPOOL_CACHE_BYTES` | `32000000` | Approximate byte cap for the page cache |
+| `MANAPOOL_CACHE_DIR` | `~/.cache/manapool-mcp` | Where the price snapshot is cached |
+| `MANAPOOL_PRICES_TTL` | `86400` | Seconds before the price snapshot is refreshed |
 | `MANAPOOL_TIMEOUT` | `20` | Per-request timeout, seconds |
 | `MANAPOOL_MIN_INTERVAL` | `0.2` | Minimum seconds between outbound request starts |
 | `MANAPOOL_USER_AGENT` | `manapool-mcp/0.1 (personal deck research)` | Outbound User-Agent |
 
-### Slow calls need a longer timeout
+HTTP mode is available for a long-running deployment, but it has no
+authentication: keep it on loopback.
 
-A price window spanning the whole catalogue takes 20–40 seconds. OpenCode's
-default tool timeout is 30 seconds, so after `opencode mcp add`, add the timeout
-by hand:
-
-```jsonc
-{
-  "mcp": {
-    "servers": {
-      "manapool": {
-        "type": "local",
-        "command": ["docker", "run", "-i", "--rm", "manapool-mcp:latest"],
-        "timeout": { "execution": 120000 }
-      }
-    }
-  }
-}
+```sh
+MANAPOOL_TRANSPORT=streamable-http MANAPOOL_PORT=8765 manapool-mcp
 ```
 
-Searches that include a `commander` finish in a second or two.
+## How the deck price search works
 
-## How the price search works
-
-ManaPool has no price filter — only bracket, sort, page, theme, colours and a
-text query. The server walks the price-sorted listing and filters locally.
+ManaPool's deck browser has no price filter — only bracket, sort, page, theme,
+colours and a text query. The server walks the price-sorted listing and filters
+locally.
 
 That sort is only *mostly* ascending. Rebuilt decks are appended to the tail at
 their new price, so the last pages can hold the cheapest listings and no
@@ -140,22 +152,23 @@ boundary can be trusted. The design follows from that:
 
 Wide windows are samples, not complete sets. Narrow with `commander` or `theme`.
 
-Prices come in two flavours: the browse tile includes the seller's basic lands;
-the deck page's `Price at <seller>` excludes them. `search_decks` returns the
-former, `get_deck` the latter.
+Deck prices come in two flavours: the browse tile includes the seller's basic
+lands; the deck page's `Price at <seller>` excludes them. `search_decks` returns
+the former, `get_deck` the latter. `price_deck` is separate: it prices
+individual cards from ManaPool's singles stock, not a seller's deck package.
 
 ## Design notes
 
 - **Parsing fails loudly.** `parse_deck_page` raises `DeckParseError` when the
   card rows stop summing to the header's count. A partial list would otherwise
   produce a confidently wrong audit.
-- **No API, no contract.** This reads the same HTML a browser gets. Fixtures in
-  `tests/fixtures/` are captured pages; when the site changes, add a fixture and
-  a test rather than loosening a regex.
+- **Rate limits are respected.** Requests are throttled, `Retry-After` is
+  honoured on 429, and pages are cached in memory with a TTL and a byte cap.
 - **Bracket data is dated.** `rules.py` documents its sources and the date the
   53-card Game Changers list was current (February 2026).
-- **Polite by default.** Requests are throttled, retried with backoff, and
-  cached in memory with both a TTL and a byte cap.
+- **No API, no contract.** The deck pages are the same HTML a browser gets.
+  Fixtures in `tests/fixtures/` are captured pages; when the site changes, add a
+  fixture and a test rather than loosening a regex.
 
 ## Development
 
@@ -163,31 +176,34 @@ former, `get_deck` the latter.
 make install   # venv + editable install with dev extras
 make check     # ruff + pytest
 make fmt       # format and autofix
-make docker    # build the image
 make smoke     # drive the server over real MCP stdio (hits the network)
 ```
 
 ```
 src/manapool_mcp/
   client.py     HTTP, throttling, retries, cache
-  parse.py      listing and deck-page HTML parsing
+  parse.py      deck listing and deck-page HTML parsing
   rules.py      Game Changers / land denial / extra turns, bracket logic
   spellbook.py  Commander Spellbook combo lookup
+  scryfall.py   name resolution and card search
+  products.py   ManaPool /products/singles
+  prices.py     ManaPool /prices/singles, disk-cached
   server.py     MCP tools and resources
   models.py     typed tool results
-tests/          61 tests, offline fixtures, fake listing fetcher
+tests/          69 tests, offline fixtures, fake fetchers
 ```
 
-CI runs lint, tests on Python 3.11–3.13, a pinned-install job against
-`constraints.txt`, and a Docker handshake smoke test with no network.
+CI runs lint, tests on Python 3.11–3.13, and a pinned-install job against
+`constraints.txt`.
 
 ## Limitations
 
-- ManaPool can change its markup at any time.
+- ManaPool can change its deck-page markup at any time.
 - Decks are rebuilt when a seller's stock changes, so a saved list can differ
   from what you read a moment ago. Re-read before buying.
-- The combo check sends card names to `backend.commanderspellbook.com`; Scryfall
-  type lookups go to `api.scryfall.com`. Nothing else leaves your machine.
+- `price_deck` uses a daily snapshot, so prices can be up to a day stale.
+- Card and combo lookups send card names to `api.scryfall.com` and
+  `backend.commanderspellbook.com`. Nothing else leaves your machine.
 - Not affiliated with ManaPool or Wizards of the Coast. Fan content.
 
 ## License
