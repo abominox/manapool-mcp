@@ -4,7 +4,7 @@
 # console script installed with `uv tool install .`; this image exists for
 # isolation and for hosts that prefer containers.
 
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
